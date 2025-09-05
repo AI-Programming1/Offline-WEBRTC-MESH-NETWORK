@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Mesh Chat</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        textarea { width: 100%; height: 150px; }
+        #messages { border: 1px solid #ccc; height: 200px; overflow-y: scroll; padding: 10px; margin-bottom: 10px; }
+        #chat input { width: 70%; }
+        h2 { margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <h1>WebRTC Mesh Chat (Local Network Only)</h1>
+    <div id="setup">
+        <label for="username">Enter Username:</label>
+        <input id="username" type="text" placeholder="Your username">
+        <button onclick="setUsername()">Set Username & Start</button>
+    </div>
+    <div id="main" style="display: none;">
+        <div id="chat">
+            <div id="messages"></div>
+            <input id="message" type="text" placeholder="Type your message">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+        <div id="connections">
+            <h2>Initiate Connection (Generate Offer SDP to Share)</h2>
+            <button onclick="createManualOffer()">Generate Offer</button>
+            <textarea id="offerSDP" placeholder="Copy this Offer SDP and share with the other user" readonly></textarea>
+            <textarea id="answerSDP" placeholder="Paste the Answer SDP received from the other user"></textarea>
+            <button onclick="setManualAnswer()">Set Answer</button>
+
+            <h2>Join Connection (Using Received Offer SDP)</h2>
+            <textarea id="remoteOffer" placeholder="Paste the Offer SDP received from the other user"></textarea>
+            <button onclick="createManualAnswer()">Generate Answer</button>
+            <textarea id="answerOutput" placeholder="Copy this Answer SDP and share back" readonly></textarea>
+        </div>
+        <div id="knownPeers">
+            <h2>Connected Peers</h2>
+            <ul id="peersList"></ul>
+        </div>
+    </div>
+
+    <script>
+        let username = '';
+        let myID = crypto.randomUUID();
+        let connections = [];
+        let knownPeers = {}; // id => username
+        let seenMessages = new Set();
+        let knownUsernames = new Set(JSON.parse(localStorage.getItem('knownUsernames')) || []);
+
+        function setUsername() {
+            username = document.getElementById('username').value.trim();
+            if (!username) return alert('Username is required');
+            document.getElementById('setup').style.display = 'none';
+            document.getElementById('main').style.display = 'block';
+        }
+
+        const config = { iceServers: [] }; // No STUN/TURN for local network only
+
+        async function createManualOffer() {
+            const pc = new RTCPeerConnection(config);
+            const dc = pc.createDataChannel('mesh');
+            const conn = { pc, dc, id: null, username: 'pending' };
+            connections.push(conn);
+            setupDataChannel(dc, conn);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            await waitForIceGathering(pc);
+            const desc = pc.localDescription;
+            document.getElementById('offerSDP').value = JSON.stringify({ type: desc.type, sdp: desc.sdp });
+        }
+
+        async function setManualAnswer() {
+            const answerStr = document.getElementById('answerSDP').value.trim();
+            if (!answerStr) return alert('Answer SDP is required');
+            const answer = JSON.parse(answerStr);
+            const pendingConn = connections.find(c => c.id === null);
+            if (!pendingConn) return alert('No pending connection found');
+            await pendingConn.pc.setRemoteDescription({ type: answer.type, sdp: answer.sdp });
+        }
+
+        async function createManualAnswer() {
+            const offerStr = document.getElementById('remoteOffer').value.trim();
+            if (!offerStr) return alert('Offer SDP is required');
+            const offer = JSON.parse(offerStr);
+            const pc = new RTCPeerConnection(config);
+            const conn = { pc, dc: null, id: null, username: 'pending' };
+            connections.push(conn);
+            pc.ondatachannel = e => {
+                conn.dc = e.channel;
+                setupDataChannel(e.channel, conn);
+            };
+            await pc.setRemoteDescription({ type: offer.type, sdp: offer.sdp });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await waitForIceGathering(pc);
+            const desc = pc.localDescription;
+            document.getElementById('answerOutput').value = JSON.stringify({ type: desc.type, sdp: desc.sdp });
+        }
+
+        function setupDataChannel(dc, conn) {
+            dc.onopen = () => {
+                const known = connections.filter(c => c.id !== null).map(c => ({ id: c.id, username: c.username }));
+                dc.send(JSON.stringify({
+                    type: 'introduction',
+                    fromID: myID,
+                    username: username,
+                    knownPeers: known
+                }));
+            };
+            dc.onmessage = e => {
+                const msg = JSON.parse(e.data);
+                handleMessage(msg, conn);
+            };
+            // Handle close/disconnect if needed
+            dc.onclose = () => {
+                // Remove conn from connections
+                connections = connections.filter(c => c !== conn);
+                updatePeersUI();
+            };
+        }
+
+        async function initiateConnection(id) {
+            if (connections.some(c => c.id === id) || id === myID) return;
+            const pc = new RTCPeerConnection(config);
+            const dc = pc.createDataChannel('mesh');
+            const conn = { pc, dc, id, username: knownPeers[id] || 'unknown' };
+            connections.push(conn);
+            setupDataChannel(dc, conn);
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            await waitForIceGathering(pc);
+            const desc = pc.localDescription;
+            const msg = {
+                type: 'offer',
+                fromID: myID,
+                targetID: id,
+                sdp: desc.sdp,
+                sdpType: desc.type,
+                messageID: crypto.randomUUID()
+            };
+            broadcast(msg);
+        }
+
+        function handleMessage(msg, conn) {
+            if (msg.messageID && seenMessages.has(msg.messageID)) return;
+            if (msg.messageID) seenMessages.add(msg.messageID);
+
+            // Forward if not introduction (flooding for broadcast/targeted)
+            if (msg.type !== 'introduction') {
+                for (let otherConn of connections) {
+                    if (otherConn !== conn && otherConn.dc && otherConn.dc.readyState === 'open') {
+                        otherConn.dc.send(JSON.stringify(msg));
+                    }
+                }
+            }
+
+            // Process if for all or me
+            if (msg.targetID === null || msg.targetID === myID) {
+                switch (msg.type) {
+                    case 'introduction':
+                        conn.id = msg.fromID;
+                        knownPeers[msg.fromID] = msg.username;
+                        conn.username = msg.username;
+                        if (!knownUsernames.has(msg.username)) {
+                            knownUsernames.add(msg.username);
+                            localStorage.setItem('knownUsernames', JSON.stringify([...knownUsernames]));
+                        }
+                        msg.knownPeers.forEach(p => {
+                            knownPeers[p.id] = p.username;
+                            if (!connections.some(c => c.id === p.id) && p.id !== myID) {
+                                initiateConnection(p.id);
+                            }
+                        });
+                        updatePeersUI();
+                        break;
+                    case 'chat':
+                        displayMessage(knownPeers[msg.fromID] || msg.fromID, msg.data);
+                        break;
+                    case 'offer':
+                        handleOffer(msg);
+                        break;
+                    case 'answer':
+                        handleAnswer(msg);
+                        break;
+                }
+            }
+        }
+
+        async function handleOffer(msg) {
+            if (connections.some(c => c.id === msg.fromID)) return;
+            knownPeers[msg.fromID] = knownPeers[msg.fromID] || 'unknown';
+            const pc = new RTCPeerConnection(config);
+            const conn = { pc, dc: null, id: msg.fromID, username: knownPeers[msg.fromID] };
+            connections.push(conn);
+            pc.ondatachannel = e => {
+                conn.dc = e.channel;
+                setupDataChannel(e.channel, conn);
+            };
+            await pc.setRemoteDescription({ type: msg.sdpType, sdp: msg.sdp });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await waitForIceGathering(pc);
+            const desc = pc.localDescription;
+            const answerMsg = {
+                type: 'answer',
+                fromID: myID,
+                targetID: msg.fromID,
+                sdp: desc.sdp,
+                sdpType: desc.type,
+                messageID: crypto.randomUUID()
+            };
+            broadcast(answerMsg);
+        }
+
+        function handleAnswer(msg) {
+            const conn = connections.find(c => c.id === msg.fromID);
+            if (conn) {
+                conn.pc.setRemoteDescription({ type: msg.sdpType, sdp: msg.sdp });
+            }
+        }
+
+        function sendMessage() {
+            const text = document.getElementById('message').value.trim();
+            if (!text) return;
+            const msg = {
+                type: 'chat',
+                fromID: myID,
+                targetID: null,
+                data: text,
+                messageID: crypto.randomUUID()
+            };
+            broadcast(msg);
+            displayMessage('You', text);
+            document.getElementById('message').value = '';
+        }
+
+        function broadcast(msg) {
+            for (let conn of connections) {
+                if (conn.dc && conn.dc.readyState === 'open') {
+                    conn.dc.send(JSON.stringify(msg));
+                }
+            }
+        }
+
+        function displayMessage(sender, text) {
+            const messagesDiv = document.getElementById('messages');
+            const p = document.createElement('p');
+            p.textContent = `${sender}: ${text}`;
+            messagesDiv.appendChild(p);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function updatePeersUI() {
+            const list = document.getElementById('peersList');
+            list.innerHTML = '';
+            connections.filter(c => c.id !== null).forEach(c => {
+                const li = document.createElement('li');
+                li.textContent = `${c.username} (${c.id.slice(0, 8)}...)`;
+                list.appendChild(li);
+            });
+        }
+
+        function waitForIceGathering(pc) {
+            return new Promise(resolve => {
+                if (pc.iceGatheringState === 'complete') return resolve();
+                pc.onicegatheringstatechange = () => {
+                    if (pc.iceGatheringState === 'complete') resolve();
+                };
+            });
+        }
+    </script>
+</body>
+</html>
